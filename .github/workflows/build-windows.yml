@@ -1,0 +1,71 @@
+name: Build Windows Release
+on:
+  push:
+    paths:
+      - '.github/workflows/build-windows.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install tools
+        run: |
+          choco install vulkan-sdk --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Vulkan SDK installation failed' }
+          $sdk = Get-ChildItem C:/VulkanSDK -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $sdk) { throw 'Vulkan SDK not found' }
+          "VULKAN_SDK=$($sdk.FullName)" >> $env:GITHUB_ENV
+          "$($sdk.FullName)/Bin" >> $env:GITHUB_PATH
+          'C:/Program Files/Git/usr/bin' >> $env:GITHUB_PATH
+          python -m pip install --upgrade 'cmake>=3.31' ninja
+          if ($LASTEXITCODE -ne 0) { throw 'Tool installation failed' }
+      - name: Configure
+        run: |
+          cmake --version
+          glslangValidator --version
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=ON -DYUZU_USE_BUNDLED_SDL3=ON -DYUZU_USE_BUNDLED_FFMPEG=ON -DYUZU_USE_BUNDLED_OPENSSL=ON -DBUILD_TESTING=OFF -DYUZU_TESTS=OFF -DYUZU_CMD=OFF -DYUZU_ROOM=OFF -DYUZU_ROOM_STANDALONE=OFF -DENABLE_WERROR=OFF -DENABLE_UPDATE_CHECKER=OFF -DUSE_DISCORD_PRESENCE=OFF -DENABLE_LTO=OFF
+          if ($LASTEXITCODE -ne 0) { throw 'Configure failed' }
+      - name: Compile
+        run: |
+          cmake --build build --target yuzu --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+      - name: Package
+        run: |
+          if (-not (Test-Path build/bin)) { throw 'Output directory missing' }
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item build/bin/* package -Recurse -Force
+          Copy-Item LICENSE.txt package
+          Copy-Item tuned/README.md package/SELEVET-README.md
+          git rev-parse HEAD | Set-Content package/source-commit.txt
+          'MSVC Release; no PGO; LTO disabled. Not equivalent to author release.' | Set-Content package/build-info.txt
+          Get-ChildItem package -Recurse
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: selevet-windows-x64-release
+          path: package/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: configure-diagnostics
+          path: |
+            build/CMakeCache.txt
+            build/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
+          retention-days: 7
