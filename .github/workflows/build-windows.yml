@@ -20,16 +20,34 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-      - name: Install LLVM and build tools
+      - name: Extract verified LLVM archive
         run: |
-          $url = 'https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.4/LLVM-23.1.4-win64.msi'
-          Invoke-WebRequest $url -OutFile "$env:RUNNER_TEMP/llvm.msi"
-          $p = Start-Process msiexec.exe -ArgumentList @('/i', "`"$env:RUNNER_TEMP/llvm.msi`"", '/qn', '/norestart', 'INSTALLDIR=C:\LLVM') -Wait -PassThru
-          if ($p.ExitCode -notin @(0,3010)) { throw "LLVM install exit $($p.ExitCode)" }
-          $llvm = @('C:/LLVM','C:/Program Files/LLVM') | Where-Object { Test-Path "$_/bin/clang-cl.exe" } | Select-Object -First 1
-          if (-not $llvm) { throw 'LLVM installation not found' }
+          Start-Transcript -Path llvm-setup.log
+          $archive = Join-Path $env:RUNNER_TEMP 'llvm.tar.xz'
+          $url = 'https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.4/clang%2Bllvm-23.1.4-x86_64-pc-windows-msvc.tar.xz'
+          curl.exe --fail --location --retry 3 --output $archive $url
+          if ($LASTEXITCODE -ne 0) { throw 'LLVM download failed' }
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Output "LLVM archive SHA256: $hash"
+          if ($hash -ne '854bffcfc84528e0ee92490ff5c178920abd358a79c3e98f053e41e3e8e4c6d2') { throw 'LLVM archive checksum mismatch' }
+          $dest = Join-Path $env:RUNNER_TEMP 'llvm-23.1.4'
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          & "$env:SystemRoot/System32/tar.exe" -xf $archive -C $dest
+          if ($LASTEXITCODE -ne 0) { throw 'LLVM extraction failed' }
+          $clang = Get-ChildItem $dest -Recurse -Filter clang-cl.exe | Where-Object { $_.Directory.Name -eq 'bin' } | Select-Object -First 1
+          if (-not $clang) { throw 'clang-cl.exe missing from archive' }
+          $llvm = $clang.Directory.Parent.FullName.Replace('\','/')
+          foreach ($tool in @('clang-cl.exe','lld-link.exe','llvm-lib.exe','llvm-profdata.exe')) {
+            if (-not (Test-Path "$llvm/bin/$tool")) { throw "Missing LLVM tool: $tool" }
+          }
+          if (-not (Test-Path "$llvm/lib/clang/23/lib/windows/clang_rt.profile-x86_64.lib")) { throw 'PGO runtime library missing' }
+          & "$llvm/bin/clang-cl.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'Clang validation failed' }
           "LLVM_ROOT=$llvm" >> $env:GITHUB_ENV
           "$llvm/bin" >> $env:GITHUB_PATH
+          Stop-Transcript
+      - name: Install remaining build tools
+        run: |
           choco install vulkan-sdk --yes --no-progress
           if ($LASTEXITCODE -ne 0) { throw 'Vulkan SDK installation failed' }
           $sdk = Get-ChildItem C:/VulkanSDK -Directory | Sort-Object Name -Descending | Select-Object -First 1
@@ -43,21 +61,18 @@ jobs:
         with:
           path: .cache/cpm
           key: pgo-vs2026-llvm2314-deps-${{ hashFiles('cpmfile.json') }}
-      - name: Validate toolchain and profile
+      - name: Validate PGO profile and adapt paths
         run: |
-          & "$env:LLVM_ROOT/bin/clang-cl.exe" --version
-          if ($LASTEXITCODE -ne 0) { throw 'Clang check failed' }
           & "$env:LLVM_ROOT/bin/llvm-profdata.exe" show tuned/eglantine.profdata
           if ($LASTEXITCODE -ne 0) { throw 'PGO profile incompatible' }
           Get-FileHash tuned/eglantine.profdata | Format-List
           $cache = Get-Content tuned/pgo-use-cache.cmake -Raw
-          $cache = $cache.Replace('C:/LLVM', $env:LLVM_ROOT.Replace('\','/'))
-          $cache = $cache.Replace('set(ENABLE_LTO ON', 'set(ENABLE_LTO ON')
+          $cache = $cache.Replace('C:/LLVM', $env:LLVM_ROOT)
           Set-Content tuned/pgo-actions-cache.cmake $cache
           Get-Content tuned/pgo-actions-cache.cmake
       - name: Configure PGO
         run: |
-          cmake -C tuned/pgo-actions-cache.cmake -S . -B build/pgo-use -G Ninja -DENABLE_WERROR=OFF -DYUZU_USE_BUNDLED_QT=ON -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON
+          cmake -C tuned/pgo-actions-cache.cmake -S . -B build/pgo-use -G Ninja -DENABLE_WERROR=OFF -DYUZU_USE_BUNDLED_QT=ON -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON 2>&1 | Tee-Object configure-pgo.log
           if ($LASTEXITCODE -ne 0) { throw 'PGO configure failed' }
       - name: Build PGO
         run: |
@@ -86,6 +101,8 @@ jobs:
         with:
           name: pgo-build-diagnostics
           path: |
+            llvm-setup.log
+            configure-pgo.log
             build-pgo.log
             build/pgo-use/CMakeCache.txt
             build/pgo-use/CMakeFiles/CMakeConfigureLog.yaml
