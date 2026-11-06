@@ -28,21 +28,20 @@ jobs:
           curl.exe --fail --location --retry 3 --output $archive $url
           if ($LASTEXITCODE -ne 0) { throw 'LLVM download failed' }
           $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          Write-Output "LLVM archive SHA256: $hash"
           if ($hash -ne '854bffcfc84528e0ee92490ff5c178920abd358a79c3e98f053e41e3e8e4c6d2') { throw 'LLVM archive checksum mismatch' }
           $dest = Join-Path $env:RUNNER_TEMP 'llvm-23.1.4'
           New-Item -ItemType Directory -Force $dest | Out-Null
           & "$env:SystemRoot/System32/tar.exe" -xf $archive -C $dest
           if ($LASTEXITCODE -ne 0) { throw 'LLVM extraction failed' }
           $clang = Get-ChildItem $dest -Recurse -Filter clang-cl.exe | Where-Object { $_.Directory.Name -eq 'bin' } | Select-Object -First 1
-          if (-not $clang) { throw 'clang-cl.exe missing from archive' }
+          if (-not $clang) { throw 'clang-cl.exe missing' }
           $llvm = $clang.Directory.Parent.FullName.Replace('\','/')
           foreach ($tool in @('clang-cl.exe','lld-link.exe','llvm-lib.exe','llvm-profdata.exe')) {
             if (-not (Test-Path "$llvm/bin/$tool")) { throw "Missing LLVM tool: $tool" }
           }
-          if (-not (Test-Path "$llvm/lib/clang/23/lib/windows/clang_rt.profile-x86_64.lib")) { throw 'PGO runtime library missing' }
+          if (-not (Test-Path "$llvm/lib/clang/23/lib/windows/clang_rt.profile-x86_64.lib")) { throw 'PGO runtime missing' }
           & "$llvm/bin/clang-cl.exe" --version
-          if ($LASTEXITCODE -ne 0) { throw 'Clang validation failed' }
+          if ($LASTEXITCODE -ne 0) { throw 'Clang check failed' }
           "LLVM_ROOT=$llvm" >> $env:GITHUB_ENV
           "$llvm/bin" >> $env:GITHUB_PATH
           Stop-Transcript
@@ -61,12 +60,13 @@ jobs:
         with:
           path: .cache/cpm
           key: pgo-vs2026-llvm2314-deps-${{ hashFiles('cpmfile.json') }}
-      - name: Validate PGO profile and adapt paths
+      - name: Prepare portable PGO configuration
         run: |
           & "$env:LLVM_ROOT/bin/llvm-profdata.exe" show tuned/eglantine.profdata
           if ($LASTEXITCODE -ne 0) { throw 'PGO profile incompatible' }
-          Get-FileHash tuned/eglantine.profdata | Format-List
           $cache = Get-Content tuned/pgo-use-cache.cmake -Raw
+          if (-not $cache.Contains('-march=znver3 -mtune=znver3')) { throw 'Unexpected original CPU flags' }
+          $cache = $cache.Replace('-march=znver3 -mtune=znver3', '-march=x86-64-v3 -mtune=generic')
           $cache = $cache.Replace('C:/LLVM', $env:LLVM_ROOT)
           Set-Content tuned/pgo-actions-cache.cmake $cache
           Get-Content tuned/pgo-actions-cache.cmake
@@ -74,38 +74,76 @@ jobs:
         run: |
           cmake -C tuned/pgo-actions-cache.cmake -S . -B build/pgo-use -G Ninja -DENABLE_WERROR=OFF -DYUZU_USE_BUNDLED_QT=ON -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON 2>&1 | Tee-Object configure-pgo.log
           if ($LASTEXITCODE -ne 0) { throw 'PGO configure failed' }
+          Select-String -Path build/pgo-use/CMakeCache.txt -Pattern '^CMAKE_(C|CXX)_FLAGS:','^ENABLE_LTO:','^ENABLE_QT:','^YUZU_USE_BUNDLED_QT:' | Out-File effective-settings.txt
       - name: Build PGO
         run: |
-          cmake --build build/pgo-use --target yuzu --parallel 4 --verbose 2>&1 | Tee-Object build-pgo.log
-          if ($LASTEXITCODE -ne 0) { throw 'PGO build failed' }
+          cmake --build build/pgo-use --target yuzu --parallel 4 2>&1 | Tee-Object build-pgo.log
+          $result = $LASTEXITCODE
+          Get-Content build-pgo.log -Tail 400 | Set-Content build-pgo-tail.log
+          Remove-Item build-pgo.log
+          if ($result -ne 0) { throw "PGO build failed: $result" }
       - name: Package
         run: |
           New-Item -ItemType Directory -Force package | Out-Null
           Copy-Item build/pgo-use/bin/* package -Recurse -Force
-          $exe = Get-ChildItem package -Filter *.exe
-          if (-not $exe) { throw 'No executable produced' }
+          if (-not (Test-Path package/selevet.exe)) { throw 'selevet.exe missing' }
           Copy-Item LICENSE.txt package
           Copy-Item tuned/README.md package/SELEVET-README.md
           git rev-parse HEAD | Set-Content package/source-commit.txt
-          'Clang 23.1.4; bundled PGO profile; LTO enabled; Zen 3 target. Runtime not tested.' | Set-Content package/build-info.txt
-          Get-FileHash $exe.FullName | Format-List | Out-File package/executable-hashes.txt
+          'Clang 23.1.4; bundled PGO; LTO enabled; x86-64-v3; generic tuning. Runner startup probe is not end-user or game validation.' | Set-Content package/build-info.txt
+          Get-FileHash package/selevet.exe | Format-List | Out-File package/executable-hashes.txt
+          & "$env:LLVM_ROOT/bin/llvm-readobj.exe" --coff-imports package/selevet.exe | Out-File executable-imports.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Import inspection failed' }
+      - name: Probe startup on runner
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Force package/user | Out-Null
+          $env:QT_DEBUG_PLUGINS = '1'
+          $env:QT_LOGGING_TO_CONSOLE = '1'
+          Get-CimInstance Win32_Processor | Select-Object Name | Out-File startup-status.txt
+          $dir = (Resolve-Path package).Path
+          $p = Start-Process -FilePath "$dir/selevet.exe" -WorkingDirectory $dir -PassThru -RedirectStandardOutput "$env:GITHUB_WORKSPACE/startup-stdout.txt" -RedirectStandardError "$env:GITHUB_WORKSPACE/startup-stderr.txt"
+          if ($p.WaitForExit(20000)) {
+            $p.WaitForExit()
+            $code = $p.ExitCode
+            "Exited within 20 seconds; ExitCode=$code; zero does not establish GUI success." | Add-Content startup-status.txt
+            Get-Content startup-status.txt
+            if ($code -ne 0) { throw "Startup exited with $code" }
+          } else {
+            $p.Refresh()
+            "Alive after 20 seconds; MainWindowHandle=$($p.MainWindowHandle); inconclusive, not GUI/game validation. Probe will terminate process." | Add-Content startup-status.txt
+            Get-Content startup-status.txt
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
+      - name: Attach probe report and clean test data
+        if: always()
+        run: |
+          if (Test-Path package/selevet.exe) {
+            if (Test-Path startup-status.txt) { Copy-Item startup-status.txt package/startup-status.txt }
+            Remove-Item package/user -Recurse -Force -ErrorAction SilentlyContinue
+          }
       - uses: actions/upload-artifact@v4
+        if: success() || (failure() && hashFiles('package/selevet.exe') != '')
         with:
-          name: selevet-windows-x64-zen3-pgo
+          name: selevet-windows-x64-v3-pgo
           path: package/
           if-no-files-found: error
           retention-days: 7
-      - name: Upload diagnostics
+      - name: Upload compact diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pgo-build-diagnostics
+          name: pgo-build-diagnostics-compact
           path: |
             llvm-setup.log
             configure-pgo.log
-            build-pgo.log
+            build-pgo-tail.log
+            effective-settings.txt
+            executable-imports.txt
+            startup-status.txt
+            startup-stdout.txt
+            startup-stderr.txt
             build/pgo-use/CMakeCache.txt
-            build/pgo-use/CMakeFiles/CMakeConfigureLog.yaml
             tuned/pgo-actions-cache.cmake
           if-no-files-found: ignore
           retention-days: 7
