@@ -1,14 +1,13 @@
-name: Build Windows Release
+name: Build Windows PGO
 on:
   push:
-    paths:
-      - '.github/workflows/build-windows.yml'
+    paths: ['.github/workflows/build-windows.yml']
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   build:
-    runs-on: windows-2022
+    runs-on: windows-2025-vs2026
     timeout-minutes: 180
     defaults:
       run:
@@ -21,8 +20,16 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-      - name: Install tools
+      - name: Install LLVM and build tools
         run: |
+          $url = 'https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.4/LLVM-23.1.4-win64.msi'
+          Invoke-WebRequest $url -OutFile "$env:RUNNER_TEMP/llvm.msi"
+          $p = Start-Process msiexec.exe -ArgumentList @('/i', "`"$env:RUNNER_TEMP/llvm.msi`"", '/qn', '/norestart', 'INSTALLDIR=C:\LLVM') -Wait -PassThru
+          if ($p.ExitCode -notin @(0,3010)) { throw "LLVM install exit $($p.ExitCode)" }
+          $llvm = @('C:/LLVM','C:/Program Files/LLVM') | Where-Object { Test-Path "$_/bin/clang-cl.exe" } | Select-Object -First 1
+          if (-not $llvm) { throw 'LLVM installation not found' }
+          "LLVM_ROOT=$llvm" >> $env:GITHUB_ENV
+          "$llvm/bin" >> $env:GITHUB_PATH
           choco install vulkan-sdk --yes --no-progress
           if ($LASTEXITCODE -ne 0) { throw 'Vulkan SDK installation failed' }
           $sdk = Get-ChildItem C:/VulkanSDK -Directory | Sort-Object Name -Descending | Select-Object -First 1
@@ -31,41 +38,57 @@ jobs:
           "$($sdk.FullName)/Bin" >> $env:GITHUB_PATH
           'C:/Program Files/Git/usr/bin' >> $env:GITHUB_PATH
           python -m pip install --upgrade 'cmake>=3.31' ninja
-          if ($LASTEXITCODE -ne 0) { throw 'Tool installation failed' }
-      - name: Configure
+          if ($LASTEXITCODE -ne 0) { throw 'Build tools installation failed' }
+      - uses: actions/cache@v4
+        with:
+          path: .cache/cpm
+          key: pgo-vs2026-llvm2314-deps-${{ hashFiles('cpmfile.json') }}
+      - name: Validate toolchain and profile
         run: |
-          cmake --version
-          glslangValidator --version
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=ON -DYUZU_USE_BUNDLED_SDL3=ON -DYUZU_USE_BUNDLED_FFMPEG=ON -DYUZU_USE_BUNDLED_OPENSSL=ON -DBUILD_TESTING=OFF -DYUZU_TESTS=OFF -DYUZU_CMD=OFF -DYUZU_ROOM=OFF -DYUZU_ROOM_STANDALONE=OFF -DENABLE_WERROR=OFF -DENABLE_UPDATE_CHECKER=OFF -DUSE_DISCORD_PRESENCE=OFF -DENABLE_LTO=OFF
-          if ($LASTEXITCODE -ne 0) { throw 'Configure failed' }
-      - name: Compile
+          & "$env:LLVM_ROOT/bin/clang-cl.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'Clang check failed' }
+          & "$env:LLVM_ROOT/bin/llvm-profdata.exe" show tuned/eglantine.profdata
+          if ($LASTEXITCODE -ne 0) { throw 'PGO profile incompatible' }
+          Get-FileHash tuned/eglantine.profdata | Format-List
+          $cache = Get-Content tuned/pgo-use-cache.cmake -Raw
+          $cache = $cache.Replace('C:/LLVM', $env:LLVM_ROOT.Replace('\','/'))
+          $cache = $cache.Replace('set(ENABLE_LTO ON', 'set(ENABLE_LTO ON')
+          Set-Content tuned/pgo-actions-cache.cmake $cache
+          Get-Content tuned/pgo-actions-cache.cmake
+      - name: Configure PGO
         run: |
-          cmake --build build --target yuzu --parallel 2
-          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          cmake -C tuned/pgo-actions-cache.cmake -S . -B build/pgo-use -G Ninja -DENABLE_WERROR=OFF -DYUZU_USE_BUNDLED_QT=ON -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON
+          if ($LASTEXITCODE -ne 0) { throw 'PGO configure failed' }
+      - name: Build PGO
+        run: |
+          cmake --build build/pgo-use --target yuzu --parallel 4 --verbose 2>&1 | Tee-Object build-pgo.log
+          if ($LASTEXITCODE -ne 0) { throw 'PGO build failed' }
       - name: Package
         run: |
-          if (-not (Test-Path build/bin)) { throw 'Output directory missing' }
           New-Item -ItemType Directory -Force package | Out-Null
-          Copy-Item build/bin/* package -Recurse -Force
+          Copy-Item build/pgo-use/bin/* package -Recurse -Force
+          $exe = Get-ChildItem package -Filter *.exe
+          if (-not $exe) { throw 'No executable produced' }
           Copy-Item LICENSE.txt package
           Copy-Item tuned/README.md package/SELEVET-README.md
           git rev-parse HEAD | Set-Content package/source-commit.txt
-          'MSVC Release; no PGO; LTO disabled. Not equivalent to author release.' | Set-Content package/build-info.txt
-          Get-ChildItem package -Recurse
-      - name: Upload package
-        uses: actions/upload-artifact@v4
+          'Clang 23.1.4; bundled PGO profile; LTO enabled; Zen 3 target. Runtime not tested.' | Set-Content package/build-info.txt
+          Get-FileHash $exe.FullName | Format-List | Out-File package/executable-hashes.txt
+      - uses: actions/upload-artifact@v4
         with:
-          name: selevet-windows-x64-release
+          name: selevet-windows-x64-zen3-pgo
           path: package/
           if-no-files-found: error
           retention-days: 7
-      - name: Upload failure diagnostics
-        if: failure()
+      - name: Upload diagnostics
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: configure-diagnostics
+          name: pgo-build-diagnostics
           path: |
-            build/CMakeCache.txt
-            build/CMakeFiles/CMakeConfigureLog.yaml
+            build-pgo.log
+            build/pgo-use/CMakeCache.txt
+            build/pgo-use/CMakeFiles/CMakeConfigureLog.yaml
+            tuned/pgo-actions-cache.cmake
           if-no-files-found: ignore
           retention-days: 7
