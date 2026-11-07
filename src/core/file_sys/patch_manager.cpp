@@ -51,6 +51,7 @@ enum class BuiltinCheck : u8 {
     Word,       ///< exactly `original` (a 4-byte write)
     BranchLink, ///< any BL instruction (a hooked call; the game's target is not fixed)
     Zero,       ///< all zero bytes (unused space a patch puts new code in)
+    LoadW8,     ///< a load into w8 (a switch the game reads; replaced by `mov w8, wzr`)
 };
 
 struct BuiltinWrite {
@@ -101,7 +102,27 @@ constexpr std::array OOT_DYNAMIC_FPS_WRITES{
                  .check = BuiltinCheck::Zero},
 };
 
+// Occlusion Off (cLohan's OcclusionOff_ZPrePassAndSamplesQuery mod, via sharkiix v2): `mov w8,
+// wzr` where the game reads its occlusion query, depth pre-pass and samples query switches, so it
+// skips that work (about +25% FPS in Kokiri village on sharkiix's RX 9060 XT).
+constexpr std::array<u8, 4> OOT_MOV_W8_WZR{0xE8, 0x03, 0x1F, 0x2A};
+constexpr std::array OOT_OCCLUSION_OFF_WRITES{
+    BuiltinWrite{.module_offset = 0x11ACF68, .bytes = OOT_MOV_W8_WZR, .check = BuiltinCheck::LoadW8},
+    BuiltinWrite{.module_offset = 0x11B838C, .bytes = OOT_MOV_W8_WZR, .check = BuiltinCheck::LoadW8},
+    BuiltinWrite{.module_offset = 0x11B83A4, .bytes = OOT_MOV_W8_WZR, .check = BuiltinCheck::LoadW8},
+    BuiltinWrite{.module_offset = 0x11ACFC8, .bytes = OOT_MOV_W8_WZR, .check = BuiltinCheck::LoadW8},
+    BuiltinWrite{.module_offset = 0x11B83DC, .bytes = OOT_MOV_W8_WZR, .check = BuiltinCheck::LoadW8},
+    BuiltinWrite{.module_offset = 0x11B83F4, .bytes = OOT_MOV_W8_WZR, .check = BuiltinCheck::LoadW8},
+};
+
 constexpr std::array BUILTIN_PATCHES{
+    BuiltinPatch{
+        .name = "Occlusion Off (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .writes = OOT_OCCLUSION_OFF_WRITES,
+    },
     BuiltinPatch{
         .name = "Max Resolution (built-in)",
         .title_id = 0x0400486024DEC000,
@@ -543,8 +564,10 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             continue;
         }
         if (patch.build_id != build_id) {
-            LOG_INFO(Loader, "    - Skipping \"{}\": build id {} is not {}", patch.name, build_id,
-                     patch.build_id);
+            LOG_WARNING(Loader,
+                        "    - Skipping \"{}\": this game version's {} has build id {}; the patch is "
+                        "made for {}",
+                        patch.name, name, build_id, patch.build_id);
             continue;
         }
         // Every write must find what it expects in the unpatched module, and none may already
@@ -561,23 +584,44 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             const u8* const original = nso.data() + offset;
             u32 word{};
             std::memcpy(&word, original, sizeof(word));
-            bool expected = false;
+            // Word: the exact original, or the patch is skipped. BranchLink and Zero are what the
+            // patch was made against; the build id already pins the module, as it does for the
+            // community mod file, so a difference there is only logged.
             switch (write.check) {
             case BuiltinCheck::Word:
-                expected = word == write.original;
+                if (word != write.original) {
+                    LOG_WARNING(Loader,
+                                "    - Skipping \"{}\": {}+{:#x} holds {:#010x}, expected {:#010x}",
+                                patch.name, name, write.module_offset, word, write.original);
+                    applicable = false;
+                }
                 break;
             case BuiltinCheck::BranchLink:
-                expected = (word & 0xFC000000U) == 0x94000000U;
+                if ((word & 0xFC000000U) != 0x94000000U) {
+                    LOG_WARNING(Loader, "    - \"{}\": {}+{:#x} holds {:#010x}, not a BL; patching anyway",
+                                patch.name, name, write.module_offset, word);
+                }
                 break;
             case BuiltinCheck::Zero:
-                expected = std::all_of(original, original + write.bytes.size(),
-                                       [](u8 byte) { return byte == 0; });
+                if (!std::all_of(original, original + write.bytes.size(),
+                                 [](u8 byte) { return byte == 0; })) {
+                    LOG_WARNING(Loader,
+                                "    - \"{}\": {}+{:#x} is not empty (first word {:#010x}); patching "
+                                "anyway",
+                                patch.name, name, write.module_offset, word);
+                }
+                break;
+            case BuiltinCheck::LoadW8:
+                // Loads and stores have bits 27-29 set; Rt (bits 0-4) is w8.
+                if ((word & 0x1FU) != 8 || ((word >> 27) & 7U) != 7U) {
+                    LOG_WARNING(Loader,
+                                "    - \"{}\": {}+{:#x} holds {:#010x}, not a load into w8; "
+                                "patching anyway",
+                                patch.name, name, write.module_offset, word);
+                }
                 break;
             }
-            if (!expected) {
-                LOG_WARNING(Loader, "    - Skipping \"{}\": {}+{:#x} holds {:#010x}, not what it patches",
-                            patch.name, name, write.module_offset, word);
-                applicable = false;
+            if (!applicable) {
                 break;
             }
             if (std::memcmp(out.data() + offset, original, write.bytes.size()) != 0) {

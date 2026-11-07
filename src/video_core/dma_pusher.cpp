@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <string_view>
+#include <span>
 #include <vector>
 
 #include "common/scope_exit.h"
@@ -33,6 +34,34 @@ namespace Tegra {
 
 constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
+
+namespace {
+// Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads. The
+// register writes that set them up only store a value: marking those too made every list fetch
+// after one wait for all the work queued before it (draws included).
+bool WritesMemory(Engines::EngineInterface* engine, Engines::EngineTypes type, u32 method,
+                  u32 count) {
+    if (type == Engines::EngineTypes::KeplerCompute) {
+        const auto* const compute = static_cast<const Engines::KeplerCompute*>(engine);
+        for (u32 i = 0; i < count; ++i) {
+            if (compute->MayWriteMemory(method + i)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (type == Engines::EngineTypes::MaxwellDMA) {
+        for (u32 i = 0; i < count; ++i) {
+            const u32 current = method + i;
+            if (current >= MacroRegistersStart ||
+                (current < engine->execution_mask.size() && engine->execution_mask[current])) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+} // Anonymous namespace
 
 DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_)
     : system{system_}
@@ -493,10 +522,9 @@ void DmaPusher::CallMethod(u32 argument) {
             ReportUnboundSubchannel();
             return;
         }
-        // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
-        const auto engine_type = subchannel_type[dma_state.subchannel];
-        const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
-                            engine_type == Engines::EngineTypes::MaxwellDMA;
+        const bool writer = split.Active() &&
+                            WritesMemory(subchannel, subchannel_type[dma_state.subchannel],
+                                         dma_state.method, 1);
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
@@ -552,10 +580,9 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             ReportUnboundSubchannel();
             return;
         }
-        // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
-        const auto engine_type = subchannel_type[dma_state.subchannel];
-        const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
-                            engine_type == Engines::EngineTypes::MaxwellDMA;
+        const bool writer = split.Active() &&
+                            WritesMemory(subchannel, subchannel_type[dma_state.subchannel],
+                                         dma_state.method, dma_state.non_incrementing ? 1 : num_methods);
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
@@ -727,22 +754,7 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
     const bool dirty = memory_manager.IsMemoryDirty(first_page, end_page - first_page,
                                                     VideoCommon::CacheType::BufferCache);
-    // The other pages draws wrote since their last flush go along in the same GPU round trip:
-    // their next lists then read guest memory instead of draining and flushing again.
-    // EDEN_NX2_CMDPAGE_BATCH=0 flushes this entry's pages only, as before.
-    static const bool batch = [] {
-        const char* value = std::getenv("EDEN_NX2_CMDPAGE_BATCH");
-        return value == nullptr || std::string_view{value} != "0";
-    }();
-    // Apply the guest's collected CPU writes before GPU data is downloaded over guest memory, as
-    // GPU::RequestFlush does: the CPU may have written new lists on these pages since the GPU
-    // last wrote them, and the download would put the old ones back (EDEN_NX2_LIST_CPU_SYNC=0:
-    // off).
-    static const bool list_cpu_sync = [] {
-        const char* value = std::getenv("EDEN_NX2_LIST_CPU_SYNC");
-        return value == nullptr || value[0] != '0';
-    }();
-    if (batch && rasterizer != nullptr) {
+    if (rasterizer != nullptr) {
         std::vector<DAddr> pages;
         for (GPUVAddr page = first_page; page < end_page; page += 0x1000) {
             if (const auto device = memory_manager.GpuToCpuAddress(page)) {
@@ -750,20 +762,13 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
             }
         }
         VideoCommon::GpuSplit::Get().Run(
-            [rasterizer = rasterizer, pages = &pages] {
-                if (list_cpu_sync) {
-                    rasterizer->InvalidateGPUCache();
-                }
-                rasterizer->FlushGpuWrittenCommandListPages(*pages);
+            [rasterizer = rasterizer, pages = std::span<const DAddr>{pages}] {
+                rasterizer->FlushGpuWrittenCommandListPages(pages);
             },
             VideoCommon::DrainSite::ListFlush);
     } else if (dirty) {
         VideoCommon::GpuSplit::Get().Run(
-            [rasterizer = rasterizer, memory = &memory_manager, first_page,
-             size = end_page - first_page] {
-                if (list_cpu_sync && rasterizer != nullptr) {
-                    rasterizer->InvalidateGPUCache();
-                }
+            [memory = &memory_manager, first_page, size = end_page - first_page] {
                 memory->FlushRegion(first_page, size, VideoCommon::CacheType::BufferCache);
             },
             VideoCommon::DrainSite::ListFlush);

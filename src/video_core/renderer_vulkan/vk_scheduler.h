@@ -25,6 +25,7 @@
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/gpu_wait_site.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_parallel_record.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -135,6 +136,11 @@ public:
         return render_pass_has_stores;
     }
 
+    /// A dispatch was recorded: the next render pass must see what it wrote.
+    void NoteComputeWrites() {
+        compute_writes_pending = true;
+    }
+
     /// Returns true when a render pass is currently active in the scheduler state.
     bool IsRenderPassActive() const {
         return state.renderpass != VK_NULL_HANDLE;
@@ -230,6 +236,7 @@ public:
             if (tick >= master_semaphore->CurrentTick()) {
                 Flush();
             }
+            VideoCommon::BackWaitScope wait_scope{"Scheduler::Wait (host GPU execution)"};
             master_semaphore->Wait(tick);
         }
         const auto trace_waited = trace ? std::chrono::steady_clock::now()
@@ -439,6 +446,8 @@ private:
     bool fragment_barrier_pending{};
     bool render_pass_has_stores{};
     u64 render_pass_serial{};
+    bool compute_writes_pending{};
+    bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;
 
     vk::QueryPool trace_query_pool;

@@ -133,6 +133,43 @@ Performance build 5 merged with zortos293/Lichii build-67 and its Ocarina of Tim
 - **The framerate isn't perfect yet:** about 26-28 fps in Kokiri Forest on a Ryzen 5 5500 with an RTX 3050, lower in the busiest views. The emulator's GPU threads are the limit, not the graphics card. Work on it continues.
 - Some shader stutter the first time new areas load.
 
+## Performance build 8: Ocarina of Time speed-ups (fix 25)
+
+Performance build 7 plus speed-ups ported from Frizti/Lichii's frizti-v2 branch, AMD shader fixes from MythosOfs/Orchid, and a wider check for the built-in patches.
+
+- **Fewer GPU thread stalls (999sian):** the split GPU thread waits for work on events instead of spinning, which frees a CPU core, and Ocarina of Time presents one frame ahead instead of waiting for each frame's GPU fence. The one-frame-ahead present adds a frame of input latency; `EDEN_NX2_FRAMES_AHEAD=0` in `nx2_switches.txt` turns it off.
+- **Bigger GPU submissions (999sian):** up to 4096 draws per native submission, with fragment barriers deferred across unrelated draws.
+- **Cheaper timing (999sian):** an invariant-TSC calibrated host clock and an inlined guest counter read.
+- **Uniform uploads (Matt Artist):** native programs' 64 KiB uniform banks upload without page protection churn.
+- **Memory lookups (zortos293):** continuous-range answers come from cached page runs, keyed by 4 KiB page because Ocarina of Time shares big pages between allocations.
+- **Deferred work (chuppatricky, Dr. Sergio):** deferred submissions go out before waiting on pending fences and fence callbacks, so those waits no longer stall on work that was never sent.
+- **Split writers (Frizti):** only compute and DMA methods that write memory count as writers for the split GPU thread's waits.
+- **Built-in patches:** a mismatched hook or code area is logged instead of skipping the patch, and a version mismatch names both build ids, so Dynamic FPS and Max Resolution apply to more dumps of the same game version.
+- **AMD (MythosOfs/Orchid):** nested returns are counted before demotes move to the end of a fragment shader (a black scene on AMD), the AMDVLK shuffle workaround needs 32-wide subgroups, and mesh and task shaders are left out of it.
+- **Events:** unsignalled MWAITX wakes retry until the event's deadline (zortos293).
+- **Diagnostics:** the log names each compute shader the first time it runs and every GPU wait of half a second or more; `EDEN_NX2_SKIP_COMPUTE=hash,hash` skips listed compute shaders for testing.
+
+## Performance build 9: Ocarina of Time on more GPUs (test build 23)
+
+Performance build 8 plus fixes and speed-ups for The Legend of Zelda: Ocarina of Time gathered from Lichii (zortos293, mja00, Felipe Lima, Frizti), Nemyu (Uesleizito Zin, PokeDinner's fixes), sharkiix's Lichii version and nxnative (penis6, K. Solen), plus this build's own translator work.
+
+- **Missing scenery:** native shaders the translator rejected are translated again, so draws that used them are no longer skipped (the Gerudo Valley cliffs, a valley's terrain and the white or green sky on AMD). The uniform register mirrors align when a shadowed register needs it, and more instruction forms can be shadowed. Every one of 4,607 Ocarina shaders captured in play translates.
+- **Shader caching (Lichii build-88):** cached pipelines the boot leaves out are built in the background on 1-2 low-priority threads (up to 256), texture descriptors are read once per handle while translating, and a draw waits up to 3 ms for a pipeline that is still building before it is skipped.
+- **Flicker:** fence-flagged query reports are written once the GPU produced them (tree leaves), queued acquires wait for their releases, and compute writes are ordered before later draws (mja00).
+- **AMD:** compare-and-swap loops retry with the value the swap returned, misaligned 64/128-bit accesses go word by word, dynamic subgroup shuffles are avoided in graphics shaders, geometry shaders stay within the output limit, pipelines are compiled one at a time on AMD's Windows driver (RX 500 cards boot), min/max/clamp are NaN-safe on AMD only, robust buffer access stays on (white fog in Hyrule Field), occlusion queries wait once per resolve, and two compute shaders that took minutes to compile are built unoptimized.
+- **AMD and Intel Arc:** float atomic adds use the GPU's native instruction where it has one, instead of a loop that could hang the GPU. Ocarina's upscaling network (its ten tensor programs) is replaced by a plain upscale on AMD and Intel, which spares minutes of compiling at the intro movie; NVIDIA keeps the network. `EDEN_NX2_UPSCALER_STANDIN=1` or `=0` forces either way.
+- **Movies:** Switch 2 movies decode on the CPU with dav1d on several threads (RTX 40/50 cards crashed at the intro movie with GPU decoding); `EDEN_NX2_VIDEO_HW=1` tries the GPU first.
+- **Speed:** a built-in Occlusion Off patch (cLohan, via sharkiix; can be turned off in Add-Ons), back-to-back compute dispatches may overlap (nxnative), and 64/128-bit global memory accesses find their buffer once instead of once per word.
+- **Mesh shaders:** point-topology mesh programs are supported.
+- **Stability:** a graphics pipeline that fails to build has its draws skipped instead of closing the emulator.
+- **Intel Arc:** the release includes `nx2_switches - Intel Arc.txt` (speed shortcuts off, upscaler stand-in on); rename it to `nx2_switches.txt` to use it.
+
+Use 1x resolution in Ocarina of Time: the game's upscaling network expects its own image sizes.
+
+## Performance build 10: FSR 3 frame generation on
+
+Performance build 9 with FSR 3 frame generation turned on by default: a generated frame is shown between each pair of real frames, which roughly doubles the frame rate on screen. It adds a little input latency and can smear fast motion or text over moving backgrounds. Graphics > "Enable Frame Generation" turns it off; "Frame Generation Type" stays FSR 3. The FSR 3 fixes from Lichii build-88 (#194: the history and current frames copied before the flow, motion vectors at the flow's resolution with the right sign) are in since build 9.
+
 ## License and AI disclosure
 
 GPL-3.0-or-later, the same as the projects it's based on. See `LICENSE.txt`.
